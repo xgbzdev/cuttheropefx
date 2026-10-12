@@ -7,12 +7,24 @@
   const restartBtn = document.getElementById("restartBtn");
   const messageEl = document.getElementById("message");
 
-  // Resize canvas to fill the screen
+  // High-DPI + proper mobile sizing
+  let dpr = 1;
+  let cssW = 0, cssH = 0;
+
   function resize() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
+    dpr = Math.min(window.devicePixelRatio || 1, 2); // cap at 2 for performance
+    cssW = window.innerWidth;
+    cssH = window.innerHeight;
+    canvas.width = Math.floor(cssW * dpr);
+    canvas.height = Math.floor(cssH * dpr);
+    canvas.style.width = cssW + "px";
+    canvas.style.height = cssH + "px";
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   }
-  window.addEventListener("resize", resize);
+  window.addEventListener("resize", function () {
+    resize();
+    // re-init only if game already started so positions stay relative
+  });
   resize();
 
   // Game state
@@ -24,79 +36,64 @@
   let win = false;
   let lastTime = 0;
 
-  // Physics constants
-  const GRAVITY = 0.35;
-  const FRICTION = 0.99;
-  const BOUNCE = 0.6;
-  const CANDY_RADIUS = 22;
-  const ROPE_SEGMENTS = 12;
+  // Tuned for mobile performance & feel
+  const GRAVITY = 0.42;
+  const FRICTION = 0.985;
+  const BOUNCE = 0.55;
+  const CANDY_RADIUS = 26;
+  const ROPE_SEGMENTS = 8;          // fewer segments = faster
+  const CONSTRAINT_ITERS = 4;       // fewer iterations = faster
 
-  // Simple 2D vector helpers
+  // Simple 2D helpers
   function Vec(x, y) {
     return { x: x || 0, y: y || 0 };
   }
-  function add(a, b) { return Vec(a.x + b.x, a.y + b.y); }
-  function sub(a, b) { return Vec(a.x - b.x, a.y - b.y); }
-  function mul(v, s) { return Vec(v.x * s, v.y * s); }
-  function len(v) { return Math.sqrt(v.x * v.x + v.y * v.y); }
-  function norm(v) {
-    const l = len(v);
-    return l > 0 ? mul(v, 1 / l) : Vec();
-  }
-  function dist(a, b) { return len(sub(a, b)); }
-
-  // Line segment intersection test
-  function segmentsIntersect(p1, p2, p3, p4) {
-    const d1 = direction(p3, p4, p1);
-    const d2 = direction(p3, p4, p2);
-    const d3 = direction(p1, p2, p3);
-    const d4 = direction(p1, p2, p4);
-    if (((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) &&
-        ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0))) {
-      return true;
-    }
-    return false;
-  }
-  function direction(a, b, c) {
-    return (c.x - a.x) * (b.y - a.y) - (b.x - a.x) * (c.y - a.y);
+  function dist(a, b) {
+    const dx = a.x - b.x, dy = a.y - b.y;
+    return Math.sqrt(dx * dx + dy * dy);
   }
 
-  // Initialize a new level
+  // Faster line-segment intersection (no allocations)
+  function segmentsIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
+    const abx = bx - ax, aby = by - ay;
+    const cdx = dx - cx, cdy = dy - cy;
+    const acx = cx - ax, acy = cy - ay;
+    const den = abx * cdy - aby * cdx;
+    if (Math.abs(den) < 1e-8) return false;
+    const t = (acx * cdy - acy * cdx) / den;
+    const u = (acx * aby - acy * abx) / den;
+    return t >= 0 && t <= 1 && u >= 0 && u <= 1;
+  }
+
   function initLevel() {
-    const w = canvas.width;
-    const h = canvas.height;
+    const w = cssW;
+    const h = cssH;
 
-    // Candy starts near the top center
     candy = {
-      pos: Vec(w * 0.5, h * 0.22),
+      pos: Vec(w * 0.5, h * 0.20),
       vel: Vec(0, 0),
       radius: CANDY_RADIUS,
       attached: true
     };
 
-    // Two anchors for two ropes
     anchors = [
-      { pos: Vec(w * 0.28, h * 0.08) },
-      { pos: Vec(w * 0.72, h * 0.08) }
+      { pos: Vec(w * 0.25, h * 0.07) },
+      { pos: Vec(w * 0.75, h * 0.07) }
     ];
 
-    // Create ropes as chains of points
     ropes = anchors.map(function (anchor) {
       return createRope(anchor.pos, candy.pos);
     });
 
-    // Stars to collect
     stars = [
-      { pos: Vec(w * 0.5, h * 0.42), collected: false, radius: 14 },
-      { pos: Vec(w * 0.35, h * 0.58), collected: false, radius: 14 },
-      { pos: Vec(w * 0.65, h * 0.58), collected: false, radius: 14 }
+      { pos: Vec(w * 0.50, h * 0.40), collected: false, radius: 16 },
+      { pos: Vec(w * 0.30, h * 0.55), collected: false, radius: 16 },
+      { pos: Vec(w * 0.70, h * 0.55), collected: false, radius: 16 }
     ];
 
-    // Monster (Om Nom style) at the bottom
     monster = {
-      pos: Vec(w * 0.5, h * 0.88),
-      radius: 38,
-      mouthOpen: 0
+      pos: Vec(w * 0.5, h * 0.86),
+      radius: 42
     };
 
     particles = [];
@@ -111,168 +108,147 @@
 
   function createRope(from, to) {
     const points = [];
+    const rest = dist(from, to) / ROPE_SEGMENTS;
     for (let i = 0; i <= ROPE_SEGMENTS; i++) {
       const t = i / ROPE_SEGMENTS;
+      const x = from.x + (to.x - from.x) * t;
+      const y = from.y + (to.y - from.y) * t;
       points.push({
-        pos: Vec(
-          from.x + (to.x - from.x) * t,
-          from.y + (to.y - from.y) * t
-        ),
-        prev: Vec(
-          from.x + (to.x - from.x) * t,
-          from.y + (to.y - from.y) * t
-        ),
+        pos: Vec(x, y),
+        prev: Vec(x, y),
         pinned: i === 0
       });
     }
-    return {
-      points: points,
-      cut: false,
-      restLength: dist(from, to) / ROPE_SEGMENTS
-    };
+    return { points: points, cut: false, restLength: rest };
   }
 
-  // Verlet integration for rope physics
   function updateRopes() {
-    ropes.forEach(function (rope) {
-      if (rope.cut) return;
+    for (let r = 0; r < ropes.length; r++) {
+      const rope = ropes[r];
+      if (rope.cut) continue;
 
-      // Update points
-      for (let i = 1; i < rope.points.length; i++) {
-        const p = rope.points[i];
+      const pts = rope.points;
+
+      // Verlet step
+      for (let i = 1; i < pts.length; i++) {
+        const p = pts[i];
         if (p.pinned) continue;
-
         const vx = (p.pos.x - p.prev.x) * FRICTION;
         const vy = (p.pos.y - p.prev.y) * FRICTION;
-
         p.prev.x = p.pos.x;
         p.prev.y = p.pos.y;
-
         p.pos.x += vx;
-        p.pos.y += vy + GRAVITY * 0.5;
+        p.pos.y += vy + GRAVITY * 0.45;
       }
 
-      // Constraints (keep segment lengths)
-      for (let iter = 0; iter < 8; iter++) {
-        for (let i = 0; i < rope.points.length - 1; i++) {
-          const a = rope.points[i];
-          const b = rope.points[i + 1];
+      // Constraints
+      for (let iter = 0; iter < CONSTRAINT_ITERS; iter++) {
+        for (let i = 0; i < pts.length - 1; i++) {
+          const a = pts[i];
+          const b = pts[i + 1];
           const dx = b.pos.x - a.pos.x;
           const dy = b.pos.y - a.pos.y;
           const d = Math.sqrt(dx * dx + dy * dy) || 0.001;
-          const diff = (d - rope.restLength) / d;
-          const offsetX = dx * 0.5 * diff;
-          const offsetY = dy * 0.5 * diff;
-
-          if (!a.pinned) {
-            a.pos.x += offsetX;
-            a.pos.y += offsetY;
-          }
-          if (!b.pinned) {
-            b.pos.x -= offsetX;
-            b.pos.y -= offsetY;
-          }
+          const diff = (d - rope.restLength) / d * 0.5;
+          const ox = dx * diff;
+          const oy = dy * diff;
+          if (!a.pinned) { a.pos.x += ox; a.pos.y += oy; }
+          if (!b.pinned) { b.pos.x -= ox; b.pos.y -= oy; }
         }
-
-        // Attach last point to candy if still attached
-        if (!rope.cut && candy.attached) {
-          const last = rope.points[rope.points.length - 1];
+        // stick last point to candy while attached
+        if (candy.attached) {
+          const last = pts[pts.length - 1];
           last.pos.x = candy.pos.x;
           last.pos.y = candy.pos.y;
         }
       }
-    });
+    }
   }
 
   function updateCandy() {
     if (!candy.attached) {
-      // Free falling
       candy.vel.y += GRAVITY;
-      candy.vel.x *= 0.995;
+      candy.vel.x *= 0.992;
       candy.pos.x += candy.vel.x;
       candy.pos.y += candy.vel.y;
 
-      // Floor bounce
-      if (candy.pos.y + candy.radius > canvas.height - 10) {
-        candy.pos.y = canvas.height - 10 - candy.radius;
+      // floor
+      if (candy.pos.y + candy.radius > cssH - 12) {
+        candy.pos.y = cssH - 12 - candy.radius;
         candy.vel.y *= -BOUNCE;
-        candy.vel.x *= 0.8;
-        if (Math.abs(candy.vel.y) < 1) candy.vel.y = 0;
+        candy.vel.x *= 0.75;
+        if (Math.abs(candy.vel.y) < 1.2) candy.vel.y = 0;
       }
-
-      // Walls
+      // walls
       if (candy.pos.x - candy.radius < 0) {
         candy.pos.x = candy.radius;
         candy.vel.x *= -BOUNCE;
       }
-      if (candy.pos.x + candy.radius > canvas.width) {
-        candy.pos.x = canvas.width - candy.radius;
+      if (candy.pos.x + candy.radius > cssW) {
+        candy.pos.x = cssW - candy.radius;
         candy.vel.x *= -BOUNCE;
       }
     } else {
-      // Pull candy toward average of rope ends
-      let activeRopes = 0;
-      let sumX = 0, sumY = 0;
-      ropes.forEach(function (rope) {
-        if (!rope.cut) {
-          const last = rope.points[rope.points.length - 1];
-          sumX += last.pos.x;
-          sumY += last.pos.y;
-          activeRopes++;
+      let active = 0, sx = 0, sy = 0;
+      for (let r = 0; r < ropes.length; r++) {
+        if (!ropes[r].cut) {
+          const last = ropes[r].points[ropes[r].points.length - 1];
+          sx += last.pos.x;
+          sy += last.pos.y;
+          active++;
         }
-      });
-
-      if (activeRopes === 0) {
+      }
+      if (active === 0) {
         candy.attached = false;
-        // Give a tiny random push so it doesn't just hang
-        candy.vel.x = (Math.random() - 0.5) * 2;
-        candy.vel.y = 0;
+        candy.vel.x = (Math.random() - 0.5) * 1.5;
+        candy.vel.y = 0.5;
       } else {
-        candy.pos.x = sumX / activeRopes;
-        candy.pos.y = sumY / activeRopes;
+        candy.pos.x = sx / active;
+        candy.pos.y = sy / active;
       }
     }
   }
 
   function checkStars() {
-    stars.forEach(function (star) {
-      if (!star.collected && dist(candy.pos, star.pos) < candy.radius + star.radius) {
+    for (let i = 0; i < stars.length; i++) {
+      const star = stars[i];
+      if (star.collected) continue;
+      if (dist(candy.pos, star.pos) < candy.radius + star.radius) {
         star.collected = true;
         starsCollected++;
         updateScore();
-        // Sparkle particles
-        for (let i = 0; i < 12; i++) {
+        // few particles only
+        for (let k = 0; k < 8; k++) {
           particles.push({
-            pos: Vec(star.pos.x, star.pos.y),
-            vel: Vec((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 6),
-            life: 40 + Math.random() * 20,
+            x: star.pos.x, y: star.pos.y,
+            vx: (Math.random() - 0.5) * 5,
+            vy: (Math.random() - 0.5) * 5,
+            life: 30,
             color: "#FFD700"
           });
         }
       }
-    });
+    }
   }
 
   function checkMonster() {
     if (gameOver) return;
     const d = dist(candy.pos, monster.pos);
-    if (d < candy.radius + monster.radius - 8) {
-      // Candy reaches the mouth
+    if (d < candy.radius + monster.radius - 10) {
       win = true;
       gameOver = true;
       messageEl.textContent = "Yum! You did it!\nStars: " + starsCollected + "/3";
       messageEl.className = "win";
-      // Celebrate particles
-      for (let i = 0; i < 30; i++) {
+      for (let k = 0; k < 18; k++) {
         particles.push({
-          pos: Vec(monster.pos.x, monster.pos.y - 20),
-          vel: Vec((Math.random() - 0.5) * 8, (Math.random() - 0.5) * 8 - 3),
-          life: 50 + Math.random() * 30,
-          color: ["#4CAF50", "#FFD700", "#FF6B6B", "#42A5F5"][Math.floor(Math.random() * 4)]
+          x: monster.pos.x, y: monster.pos.y - 15,
+          vx: (Math.random() - 0.5) * 7,
+          vy: (Math.random() - 0.5) * 7 - 2,
+          life: 40,
+          color: ["#4CAF50", "#FFD700", "#FF6B6B"][k % 3]
         });
       }
-    } else if (candy.pos.y > canvas.height + 50) {
-      // Fell off screen
+    } else if (candy.pos.y > cssH + 60) {
       gameOver = true;
       win = false;
       messageEl.textContent = "Oh no! Try again";
@@ -283,9 +259,9 @@
   function updateParticles() {
     for (let i = particles.length - 1; i >= 0; i--) {
       const p = particles[i];
-      p.pos.x += p.vel.x;
-      p.pos.y += p.vel.y;
-      p.vel.y += 0.15;
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += 0.18;
       p.life--;
       if (p.life <= 0) particles.splice(i, 1);
     }
@@ -295,135 +271,122 @@
     scoreEl.textContent = "Stars: " + starsCollected + "/3";
   }
 
-  // Drawing
+  // ---------- Drawing (all in CSS pixels) ----------
   function draw() {
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.clearRect(0, 0, cssW, cssH);
 
-    // Soft ground
+    // ground
     ctx.fillStyle = "#A5D6A7";
-    ctx.fillRect(0, canvas.height - 40, canvas.width, 40);
+    ctx.fillRect(0, cssH - 36, cssW, 36);
     ctx.fillStyle = "#81C784";
-    ctx.fillRect(0, canvas.height - 15, canvas.width, 15);
+    ctx.fillRect(0, cssH - 12, cssW, 12);
 
-    // Draw ropes
-    ropes.forEach(function (rope) {
-      if (rope.cut) return;
+    // ropes
+    for (let r = 0; r < ropes.length; r++) {
+      const rope = ropes[r];
+      if (rope.cut) continue;
+      const pts = rope.points;
       ctx.beginPath();
       ctx.strokeStyle = "#5D4037";
-      ctx.lineWidth = 4;
+      ctx.lineWidth = 5;
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
-      rope.points.forEach(function (p, i) {
-        if (i === 0) ctx.moveTo(p.pos.x, p.pos.y);
-        else ctx.lineTo(p.pos.x, p.pos.y);
-      });
-      ctx.stroke();
-
-      // Small knots
-      ctx.fillStyle = "#3E2723";
-      rope.points.forEach(function (p) {
-        ctx.beginPath();
-        ctx.arc(p.pos.x, p.pos.y, 3, 0, Math.PI * 2);
-        ctx.fill();
-      });
-    });
-
-    // Anchors
-    anchors.forEach(function (a) {
-      ctx.beginPath();
-      ctx.fillStyle = "#37474F";
-      ctx.arc(a.pos.x, a.pos.y, 10, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.strokeStyle = "#263238";
-      ctx.lineWidth = 2;
-      ctx.stroke();
-    });
-
-    // Stars
-    stars.forEach(function (star) {
-      if (star.collected) return;
-      drawStar(star.pos.x, star.pos.y, star.radius, "#FFD700", "#FFA000");
-    });
-
-    // Candy (red with white stripe)
-    drawCandy(candy.pos.x, candy.pos.y, candy.radius);
-
-    // Monster (simple Om Nom-like)
-    drawMonster(monster.pos.x, monster.pos.y, monster.radius);
-
-    // Cut path (while swiping)
-    if (cutPath.length > 1) {
-      ctx.beginPath();
-      ctx.strokeStyle = "rgba(255, 80, 80, 0.7)";
-      ctx.lineWidth = 3;
-      ctx.lineCap = "round";
-      cutPath.forEach(function (p, i) {
-        if (i === 0) ctx.moveTo(p.x, p.y);
-        else ctx.lineTo(p.x, p.y);
-      });
+      ctx.moveTo(pts[0].pos.x, pts[0].pos.y);
+      for (let i = 1; i < pts.length; i++) {
+        ctx.lineTo(pts[i].pos.x, pts[i].pos.y);
+      }
       ctx.stroke();
     }
 
-    // Particles
-    particles.forEach(function (p) {
-      ctx.globalAlpha = Math.min(1, p.life / 30);
+    // anchors
+    for (let i = 0; i < anchors.length; i++) {
+      const a = anchors[i];
+      ctx.beginPath();
+      ctx.fillStyle = "#37474F";
+      ctx.arc(a.pos.x, a.pos.y, 11, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // stars
+    for (let i = 0; i < stars.length; i++) {
+      if (!stars[i].collected) drawStar(stars[i].pos.x, stars[i].pos.y, stars[i].radius);
+    }
+
+    // candy
+    drawCandy(candy.pos.x, candy.pos.y, candy.radius);
+
+    // monster
+    drawMonster(monster.pos.x, monster.pos.y, monster.radius);
+
+    // cut trail
+    if (cutPath.length > 1) {
+      ctx.beginPath();
+      ctx.strokeStyle = "rgba(255,70,70,0.75)";
+      ctx.lineWidth = 4;
+      ctx.lineCap = "round";
+      ctx.moveTo(cutPath[0].x, cutPath[0].y);
+      for (let i = 1; i < cutPath.length; i++) {
+        ctx.lineTo(cutPath[i].x, cutPath[i].y);
+      }
+      ctx.stroke();
+    }
+
+    // particles
+    for (let i = 0; i < particles.length; i++) {
+      const p = particles[i];
+      ctx.globalAlpha = Math.min(1, p.life / 25);
       ctx.fillStyle = p.color;
       ctx.beginPath();
-      ctx.arc(p.pos.x, p.pos.y, 4, 0, Math.PI * 2);
+      ctx.arc(p.x, p.y, 3.5, 0, Math.PI * 2);
       ctx.fill();
-      ctx.globalAlpha = 1;
-    });
+    }
+    ctx.globalAlpha = 1;
   }
 
-  function drawStar(x, y, r, fill, stroke) {
+  function drawStar(x, y, r) {
     ctx.save();
     ctx.translate(x, y);
     ctx.beginPath();
     for (let i = 0; i < 5; i++) {
-      ctx.lineTo(
-        Math.cos((18 + i * 72) * Math.PI / 180) * r,
-        -Math.sin((18 + i * 72) * Math.PI / 180) * r
-      );
-      ctx.lineTo(
-        Math.cos((54 + i * 72) * Math.PI / 180) * (r * 0.45),
-        -Math.sin((54 + i * 72) * Math.PI / 180) * (r * 0.45)
-      );
+      const a1 = (18 + i * 72) * Math.PI / 180;
+      const a2 = (54 + i * 72) * Math.PI / 180;
+      ctx.lineTo(Math.cos(a1) * r, -Math.sin(a1) * r);
+      ctx.lineTo(Math.cos(a2) * r * 0.42, -Math.sin(a2) * r * 0.42);
     }
     ctx.closePath();
-    ctx.fillStyle = fill;
+    ctx.fillStyle = "#FFD700";
     ctx.fill();
-    ctx.strokeStyle = stroke;
+    ctx.strokeStyle = "#FFA000";
     ctx.lineWidth = 1.5;
     ctx.stroke();
     ctx.restore();
   }
 
   function drawCandy(x, y, r) {
-    // Main body
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fillStyle = "#E53935";
     ctx.fill();
     ctx.strokeStyle = "#B71C1C";
-    ctx.lineWidth = 2;
+    ctx.lineWidth = 2.5;
     ctx.stroke();
 
-    // White stripe
+    // stripe
     ctx.beginPath();
-    ctx.arc(x, y, r * 0.7, -0.6, 0.6);
+    ctx.arc(x, y, r * 0.68, -0.55, 0.55);
     ctx.strokeStyle = "#FFECB3";
-    ctx.lineWidth = 6;
+    ctx.lineWidth = 7;
     ctx.stroke();
 
-    // Shine
+    // shine
     ctx.beginPath();
-    ctx.arc(x - r * 0.3, y - r * 0.3, r * 0.25, 0, Math.PI * 2);
-    ctx.fillStyle = "rgba(255,255,255,0.5)";
+    ctx.arc(x - r * 0.28, y - r * 0.28, r * 0.22, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(255,255,255,0.45)";
     ctx.fill();
   }
 
   function drawMonster(x, y, r) {
-    // Body
+    // body
     ctx.beginPath();
     ctx.arc(x, y, r, 0, Math.PI * 2);
     ctx.fillStyle = "#43A047";
@@ -432,50 +395,58 @@
     ctx.lineWidth = 3;
     ctx.stroke();
 
-    // Eyes
-    ctx.fillStyle = "white";
+    // eyes
+    ctx.fillStyle = "#fff";
     ctx.beginPath();
-    ctx.arc(x - 12, y - 10, 10, 0, Math.PI * 2);
-    ctx.arc(x + 12, y - 10, 10, 0, Math.PI * 2);
+    ctx.arc(x - 13, y - 11, 11, 0, Math.PI * 2);
+    ctx.arc(x + 13, y - 11, 11, 0, Math.PI * 2);
     ctx.fill();
-
     ctx.fillStyle = "#1B5E20";
     ctx.beginPath();
-    ctx.arc(x - 12, y - 8, 5, 0, Math.PI * 2);
-    ctx.arc(x + 12, y - 8, 5, 0, Math.PI * 2);
+    ctx.arc(x - 13, y - 9, 5.5, 0, Math.PI * 2);
+    ctx.arc(x + 13, y - 9, 5.5, 0, Math.PI * 2);
     ctx.fill();
 
-    // Mouth
+    // mouth
     ctx.beginPath();
-    ctx.arc(x, y + 8, 16, 0.15 * Math.PI, 0.85 * Math.PI);
+    ctx.arc(x, y + 9, 17, 0.2 * Math.PI, 0.8 * Math.PI);
     ctx.strokeStyle = "#1B5E20";
     ctx.lineWidth = 3;
     ctx.stroke();
 
-    // Teeth
-    ctx.fillStyle = "white";
-    ctx.fillRect(x - 8, y + 4, 5, 8);
-    ctx.fillRect(x + 3, y + 4, 5, 8);
+    // teeth
+    ctx.fillStyle = "#fff";
+    ctx.fillRect(x - 9, y + 5, 6, 9);
+    ctx.fillRect(x + 3, y + 5, 6, 9);
   }
 
-  // Cutting logic
+  // ---------- Cutting (more forgiving on touch) ----------
   function tryCutRopes() {
     if (cutPath.length < 2) return;
 
-    ropes.forEach(function (rope) {
-      if (rope.cut) return;
-      for (let i = 0; i < rope.points.length - 1; i++) {
-        const a = rope.points[i].pos;
-        const b = rope.points[i + 1].pos;
+    for (let r = 0; r < ropes.length; r++) {
+      const rope = ropes[r];
+      if (rope.cut) continue;
+      const pts = rope.points;
+
+      for (let i = 0; i < pts.length - 1; i++) {
+        const ax = pts[i].pos.x, ay = pts[i].pos.y;
+        const bx = pts[i + 1].pos.x, by = pts[i + 1].pos.y;
+
         for (let j = 0; j < cutPath.length - 1; j++) {
-          if (segmentsIntersect(a, b, cutPath[j], cutPath[j + 1])) {
+          if (segmentsIntersect(
+            ax, ay, bx, by,
+            cutPath[j].x, cutPath[j].y,
+            cutPath[j + 1].x, cutPath[j + 1].y
+          )) {
             rope.cut = true;
-            // Visual feedback
-            for (let k = 0; k < 8; k++) {
+            // small feedback
+            for (let k = 0; k < 5; k++) {
               particles.push({
-                pos: Vec((a.x + b.x) / 2, (a.y + b.y) / 2),
-                vel: Vec((Math.random() - 0.5) * 5, (Math.random() - 0.5) * 5),
-                life: 25,
+                x: (ax + bx) * 0.5, y: (ay + by) * 0.5,
+                vx: (Math.random() - 0.5) * 4,
+                vy: (Math.random() - 0.5) * 4,
+                life: 20,
                 color: "#8D6E63"
               });
             }
@@ -483,16 +454,24 @@
           }
         }
       }
-    });
+    }
   }
 
-  // Input handling (mouse + touch)
+  // ---------- Input (robust touch + mouse) ----------
   function getPos(e) {
     const rect = canvas.getBoundingClientRect();
-    if (e.touches && e.touches.length > 0) {
-      return Vec(e.touches[0].clientX - rect.left, e.touches[0].clientY - rect.top);
+    let clientX, clientY;
+    if (e.touches && e.touches.length) {
+      clientX = e.touches[0].clientX;
+      clientY = e.touches[0].clientY;
+    } else if (e.changedTouches && e.changedTouches.length) {
+      clientX = e.changedTouches[0].clientX;
+      clientY = e.changedTouches[0].clientY;
+    } else {
+      clientX = e.clientX;
+      clientY = e.clientY;
     }
-    return Vec(e.clientX - rect.left, e.clientY - rect.top);
+    return Vec(clientX - rect.left, clientY - rect.top);
   }
 
   function startCut(e) {
@@ -505,10 +484,14 @@
   function moveCut(e) {
     if (!isCutting || gameOver) return;
     e.preventDefault();
-    cutPath.push(getPos(e));
-    // Keep path reasonable length
-    if (cutPath.length > 40) cutPath.shift();
-    tryCutRopes();
+    const p = getPos(e);
+    // only add if moved enough (reduces points + lag)
+    const last = cutPath[cutPath.length - 1];
+    if (Math.abs(p.x - last.x) > 3 || Math.abs(p.y - last.y) > 3) {
+      cutPath.push(p);
+      if (cutPath.length > 30) cutPath.shift();
+      tryCutRopes();
+    }
   }
 
   function endCut(e) {
@@ -519,24 +502,36 @@
     cutPath = [];
   }
 
+  // Mouse
   canvas.addEventListener("mousedown", startCut);
   canvas.addEventListener("mousemove", moveCut);
   canvas.addEventListener("mouseup", endCut);
   canvas.addEventListener("mouseleave", endCut);
 
+  // Touch (non-passive so we can preventDefault)
   canvas.addEventListener("touchstart", startCut, { passive: false });
   canvas.addEventListener("touchmove", moveCut, { passive: false });
   canvas.addEventListener("touchend", endCut, { passive: false });
   canvas.addEventListener("touchcancel", endCut, { passive: false });
 
-  restartBtn.addEventListener("click", function () {
+  // Prevent page scroll / zoom while playing
+  document.body.addEventListener("touchmove", function (e) {
+    if (e.target === canvas) e.preventDefault();
+  }, { passive: false });
+
+  restartBtn.addEventListener("click", function (e) {
+    e.preventDefault();
+    initLevel();
+  });
+  restartBtn.addEventListener("touchend", function (e) {
+    e.preventDefault();
     initLevel();
   });
 
-  // Main loop
-  function loop(timestamp) {
-    const dt = Math.min(32, timestamp - lastTime);
-    lastTime = timestamp;
+  // Main loop – use requestAnimationFrame only
+  function loop(ts) {
+    if (!lastTime) lastTime = ts;
+    lastTime = ts;
 
     if (!gameOver) {
       updateRopes();
@@ -546,7 +541,6 @@
     }
     updateParticles();
     draw();
-
     requestAnimationFrame(loop);
   }
 
