@@ -1,0 +1,17 @@
+{
+  "name": "Cut the Rope",
+  "description": "A basic Cut the Rope game for Firefox OS",
+  "version": "1.0.0",
+  "launch_path": "/index.html",
+  "icons": {
+    "128": "/icon-128.png"
+  },
+  "developer": {
+    "name": "Grok",
+    "url": "https://x.ai"
+  },
+  "orientation": "portrait",
+  "type": "web",
+  "permissions": {},
+  "default_locale": "en"
+}
